@@ -440,3 +440,17 @@ void build_fake_frame(const uint8_t *template_frame, size_t template_len,
   tcp_hdr[16] = (tcp_cksum >> 8) & 0xFF;
   tcp_hdr[17] = tcp_cksum & 0xFF;
 }
+
+struct io_uring_sqe *sqe_with_cb(struct io_uring *ring, ev_cb cb, void *ud) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+  if (!sqe) {
+    io_uring_submit(ring);
+    sqe = io_uring_get_sqe(ring);
+  }
+  struct cb_ctx *ctx = malloc(sizeof(*ctx));
+  ctx->cb = cb;
+  ctx->ring = ring;
+  ctx->ud = ud;
+  io_uring_sqe_set_data(sqe, ctx);
+  return sqe;
+}

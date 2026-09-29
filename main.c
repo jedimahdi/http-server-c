@@ -15,12 +15,14 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
-#include "pm_loop.h"
+#include <liburing.h>
+#include <llhttp.h>
+
+#include "pm_ringbuf.h"
 #include "utils.h"
-#include "pm_reader.h"
-#include "pm_writer.h"
 
 typedef enum {
+  HP_ERROR = 0,
   HP_METHOD,
   HP_URI,
   HP_VERSION,
@@ -29,7 +31,6 @@ typedef enum {
   HP_HEADERS_DONE,
   HP_BODY,
   HP_DONE,
-  HP_ERROR
 } Http_Parser_State;
 
 typedef struct {
@@ -88,7 +89,6 @@ static void hp_on_header_done(Http_Parser *p) {
 }
 
 ssize_t hp_execute(Http_Parser *p, const char *data, size_t len) {
-  printf("execute: '%.*s'\n", len, data);
   size_t i = 0;
   while (i < len && p->state != HP_DONE && p->state != HP_ERROR) {
     char c = data[i++];
@@ -185,7 +185,81 @@ ssize_t hp_execute(Http_Parser *p, const char *data, size_t len) {
   return i;
 }
 
-void send_response(pm_writer *w, int status, const char *reason, const char *body, size_t body_len, bool keep_alive) {
+typedef struct {
+  int client_sock;
+  pm_ringbuf read_buf;
+  pm_ringbuf write_buf;
+  Http_Parser parser;
+  bool close_after_flush;
+} Conn;
+
+void on_read(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud);
+void on_write(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud);
+
+void conn_close(Conn *conn) {
+  LOG_INFO("[Client] fd=%d closing", conn->client_sock);
+
+  pm_ringbuf_free(&conn->read_buf);
+  pm_ringbuf_free(&conn->write_buf);
+  close(conn->client_sock);
+  free(conn);
+}
+
+void conn_submit_read(struct io_uring *ring, Conn *conn) {
+  int client_sock = conn->client_sock;
+  struct iovec spans[2];
+  pm_ringbuf_get_free_spans(&conn->read_buf, spans);
+
+  if (spans[1].iov_len == 0) {
+    io_uring_prep_read(sqe_with_cb(ring, on_read, conn), client_sock, spans[0].iov_base, spans[0].iov_len, 0);
+  } else {
+    io_uring_prep_readv(sqe_with_cb(ring, on_read, conn), client_sock, spans, 2, 0);
+  }
+}
+
+void conn_submit_write(struct io_uring *ring, Conn *conn) {
+  int client_sock = conn->client_sock;
+  struct iovec spans[2];
+  pm_ringbuf_get_used_spans(&conn->write_buf, spans);
+
+  if (spans[1].iov_len == 0) {
+    io_uring_prep_write(sqe_with_cb(ring, on_write, conn), client_sock, spans[0].iov_base, spans[0].iov_len, 0);
+  } else {
+    io_uring_prep_writev(sqe_with_cb(ring, on_write, conn), client_sock, spans, 2, 0);
+  }
+}
+
+void append_ringbuf(pm_ringbuf *rb, const char *data, size_t size) {
+  size_t used = pm_ringbuf_total_used(rb);
+  size_t needed_cap = used + size;
+
+  if (rb->cap < needed_cap) {
+    size_t min_new_cap = rb->cap;
+    while (min_new_cap < needed_cap) {
+      min_new_cap *= 2;
+    }
+
+    if (!pm_ringbuf_grow(rb, min_new_cap)) {
+      LOG_ERROR("realloc failed");
+      exit(1);
+    }
+  }
+
+  struct iovec free_spans[2];
+  pm_ringbuf_get_free_spans(rb, free_spans);
+
+  size_t first_copy = size < free_spans[0].iov_len ? size : free_spans[0].iov_len;
+  memcpy(free_spans[0].iov_base, data, first_copy);
+  pm_ringbuf_advance_tail(rb, first_copy);
+
+  size_t remaining = size - first_copy;
+  if (remaining > 0) {
+    memcpy(free_spans[1].iov_base, (const uint8_t *)data + first_copy, remaining);
+    pm_ringbuf_advance_tail(rb, remaining);
+  }
+}
+
+void send_response(struct io_uring *ring, Conn *conn, int status, const char *reason, const char *body, size_t body_len, bool keep_alive) {
   char hdr[512];
   int n = snprintf(hdr, sizeof(hdr),
                    "HTTP/1.1 %d %s\r\n"
@@ -196,144 +270,117 @@ void send_response(pm_writer *w, int status, const char *reason, const char *bod
                    status, reason, body_len,
                    keep_alive ? "keep-alive" : "close");
 
-  pm_writer_append_bytes(w, hdr, n);
-  if (body_len > 0) pm_writer_append_bytes(w, body, body_len);
-  pm_writer_flush(w);
+  append_ringbuf(&conn->write_buf, hdr, n);
+  if (body_len > 0) append_ringbuf(&conn->write_buf, body, body_len);
+  conn_submit_write(ring, conn);
 }
 
-typedef struct {
-  int client_sock;
-  pm_reader reader;
-  pm_writer writer;
-  Http_Parser parser;
-  bool close_after_flush;
-} Conn;
+void dispatch(struct io_uring *ring, Conn *conn) {
+  Http_Parser *p = &conn->parser;
 
-static Conn *new_connection(int client_sock) {
-  Conn *conn = malloc(sizeof(*conn));
-  conn->client_sock = client_sock;
-  pm_reader_init(&conn->reader, conn->client_sock, 4096);
-  pm_writer_init(&conn->writer, conn->client_sock, 4096);
-  hp_init(&conn->parser);
-  return conn;
+  LOG_INFO("method = %s, uri = %s", p->method, p->uri);
+
+  if (strcmp(p->method, "GET") == 0 && strcmp(p->uri, "/") == 0) {
+    const char *body = "hello, world!\n";
+    send_response(ring, conn, 200, "OK", body, strlen(body), p->keep_alive);
+  } else {
+    const char *body = "not found\n";
+    send_response(ring, conn, 404, "Not Found", body, strlen(body), p->keep_alive);
+  }
 }
 
-static void close_connection(Conn *conn, pm_loop *l) {
-  LOG_INFO("[Client] fd=%d closing", conn->client_sock);
+void process_client(struct io_uring *ring, Conn *conn) {
+  struct iovec spans[2];
+  pm_ringbuf_get_used_spans(&conn->read_buf, spans);
 
-  pm_reader_free(&conn->reader);
-  pm_writer_free(&conn->writer);
-  pm_loop_del(l, conn->client_sock);
-  close(conn->client_sock);
-  free(conn);
-}
+  ssize_t nparse = hp_execute(&conn->parser, spans[0].iov_base, spans[0].iov_len);
+  ssize_t nparse2 = 0;
+  if (spans[1].iov_len > 0 && conn->parser.state != HP_DONE) {
+    nparse2 = hp_execute(&conn->parser, spans[1].iov_base, spans[1].iov_len);
+  }
+  pm_ringbuf_advance_head(&conn->read_buf, nparse + nparse2);
 
-void update_events(Conn *conn, pm_loop *l) {
-  pm_event_mask mask = PM_EVENT_READABLE;
-  if (!pm_writer_is_empty(&conn->writer)) mask |= PM_EVENT_WRITABLE;
-  pm_loop_mod(l, conn->client_sock, mask);
-}
-
-void handle_client(int client_sock, pm_loop *l, pm_event_mask events, void *ud) {
-  Conn *conn = ud;
-
-  if (events & (PM_EVENT_HANGUP | PM_EVENT_ERROR)) {
-    LOG_WARN("[Client] hangup | err");
-    close_connection(conn, l);
+  if (conn->parser.state == HP_ERROR) {
+    LOG_ERROR("invalid request");
+    send_response(ring, conn, 400, "Bad Request", "bad request\n", 12, false);
+    //
+    conn_close(conn);
+    return;
+  } else if (conn->parser.state != HP_DONE) {
+    LOG_INFO("need more");
+    conn_submit_read(ring, conn);
     return;
   }
 
-  if (events & PM_EVENT_READABLE) {
-    ssize_t nread = pm_reader_fill(&conn->reader);
+  dispatch(ring, conn);
+  hp_reset(&conn->parser);
 
-    size_t avail = 0;
-    char *buf = (char *)pm_reader_peek(&conn->reader, &avail);
+  size_t used = pm_ringbuf_total_used(&conn->read_buf);
+  if (used > 0)
+    return process_client(ring, conn);
 
-    if (nread < 0) {
-      LOG_ERROR("handle_client: read failed: %s", strerror(errno));
-      close_connection(conn, l);
-      return;
-    }
-    if (nread == 0 && conn->reader.eof) {
-      LOG_INFO("[Client] fd=%d EOF", client_sock);
-      close_connection(conn, l);
-      return;
-    }
+  if (conn->parser.keep_alive) {
+    conn_submit_read(ring, conn);
+  } else {
+    conn->close_after_flush = true;
   }
-
-  if (events & PM_EVENT_WRITABLE) {
-    pm_writer_flush(&conn->writer);
-    // pm_writer_dump(&conn->writer);
-
-    if (conn->close_after_flush && pm_writer_is_empty(&conn->writer)) {
-      close_connection(conn, l);
-      return;
-    }
-  }
-
-  while (true) {
-    struct iovec spans[2];
-    pm_reader_peek_split(&conn->reader, spans);
-
-    if (spans[0].iov_len == 0) break;
-
-    ssize_t r1 = hp_execute(&conn->parser, spans[0].iov_base, spans[0].iov_len);
-    ssize_t r2 = 0;
-    if (r1 == (ssize_t)spans[0].iov_len && spans[1].iov_len > 0) {
-      r2 = hp_execute(&conn->parser, spans[1].iov_base, spans[1].iov_len);
-    }
-    pm_reader_skip(&conn->reader, r1 + r2);
-
-    if (conn->parser.state == HP_ERROR) {
-      send_response(&conn->writer, 400, "Bad Request", "bad request\n", 12, false);
-      close_connection(conn, l);
-      return;
-    }
-
-    if (conn->parser.state == HP_DONE) {
-      Http_Parser *p = &conn->parser;
-
-      printf("method = %s, uri = %s\n", p->method, p->uri);
-
-      if (strcmp(p->method, "GET") == 0 && strcmp(p->uri, "/") == 0) {
-        const char *body = "hello, world!\n";
-        send_response(&conn->writer, 200, "OK", body, strlen(body), p->keep_alive);
-      } else {
-        const char *body = "not found\n";
-        send_response(&conn->writer, 404, "Not Found", body, strlen(body), p->keep_alive);
-      }
-
-      if (p->keep_alive) {
-        hp_reset(p);
-        LOG_INFO("keep alive is on");
-      } else {
-        conn->close_after_flush = true;
-        break;
-      }
-    } else {
-      break;
-    }
-  }
-
-  update_events(conn, l);
 }
 
-void on_accept(int server_sock, pm_loop *l, pm_event_mask events, void *ud) {
-  (void)ud;
-  (void)events;
-
-  while (true) {
-    int client_sock = accept4(server_sock, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
-    if (client_sock < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-      if (errno == EINTR) continue;
-      LOG_ERROR("accept4: %s", strerror(errno));
-      exit(1);
-    }
-
-    Conn *conn = new_connection(client_sock);
-    pm_loop_add(l, client_sock, PM_EVENT_READABLE, handle_client, conn);
+void on_read(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud) {
+  Conn *conn = ud;
+  int client_sock = conn->client_sock;
+  ssize_t nread = cqe->res;
+  if (nread < 0) {
+    conn_close(conn);
+    LOG_ERROR("read error: %s", strerror(-nread));
+    return;
   }
+  if (nread == 0) {
+    conn->close_after_flush = true;
+    LOG_INFO("read eof");
+    return;
+  }
+
+  pm_ringbuf_advance_tail(&conn->read_buf, nread);
+  process_client(ring, conn);
+}
+
+void on_write(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud) {
+  Conn *conn = ud;
+  int client_sock = conn->client_sock;
+  ssize_t nwrite = cqe->res;
+  if (nwrite < 0) {
+    LOG_ERROR("write error: %s", strerror(-nwrite));
+    conn_close(conn);
+    return;
+  }
+  if (nwrite == 0) {
+    LOG_ERROR("write eof");
+    conn_close(conn);
+    return;
+  }
+
+  pm_ringbuf_advance_head(&conn->write_buf, nwrite);
+
+  size_t used = pm_ringbuf_total_used(&conn->write_buf);
+  if (used > 0) {
+    conn_submit_write(ring, conn);
+  }
+}
+
+void on_accept(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud) {
+  LOG_INFO("on_accept");
+  (void)ud;
+
+  int client_sock = cqe->res;
+
+  Conn *conn = malloc(sizeof(*conn));
+  conn->client_sock = client_sock;
+  pm_ringbuf_init(&conn->read_buf, 4096);
+  pm_ringbuf_init(&conn->write_buf, 4096);
+  hp_init(&conn->parser);
+
+  conn_submit_read(ring, conn);
 }
 
 int main() {
@@ -341,15 +388,29 @@ int main() {
   char *hostname = "127.0.0.1";
   char *port = "8000";
   int server_sock = listen_tcp(hostname, port);
-  set_nonblocking(server_sock);
 
   LOG_WARN("Listening on %s:%s...", hostname, port);
 
-  pm_loop l;
-  pm_loop_init(&l);
-  pm_loop_add(&l, server_sock, PM_EVENT_READABLE, on_accept, NULL);
-  pm_loop_run(&l, -1);
-  pm_loop_free(&l);
+  struct io_uring ring;
+  io_uring_queue_init(256, &ring, 0);
+
+  io_uring_prep_multishot_accept(sqe_with_cb(&ring, on_accept, NULL), server_sock, NULL, NULL, 0);
+
+  while (true) {
+    io_uring_submit_and_wait(&ring, 1);
+
+    struct io_uring_cqe *cqe;
+    unsigned head, count = 0;
+    io_uring_for_each_cqe(&ring, head, cqe) {
+      struct cb_ctx *ctx = io_uring_cqe_get_data(cqe);
+      ctx->cb(ctx->ring, cqe, ctx->ud);
+      if (!(cqe->flags & IORING_CQE_F_MORE))
+        free(ctx);
+      count++;
+    }
+
+    io_uring_cq_advance(&ring, count);
+  }
 
   return 0;
 }

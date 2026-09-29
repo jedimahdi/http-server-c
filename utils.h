@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <liburing.h>
 
 #define FORMAT_CHECK(fmt_pos, args_pos) __attribute__((format(printf, fmt_pos, args_pos)))
 
@@ -38,3 +39,13 @@ int rawsocket(int iface_index);
 void build_client_hello(const char *sni, uint8_t *out_buffer);
 
 void build_fake_frame(const uint8_t *template_frame, size_t template_len, uint32_t client_isn, const uint8_t *fake_payload, size_t fake_len, uint8_t *out, size_t *out_len);
+
+typedef void (*ev_cb)(struct io_uring *ring, struct io_uring_cqe *cqe, void *ud);
+
+struct cb_ctx {
+  ev_cb cb;
+  void *ud;
+  struct io_uring *ring;
+};
+
+struct io_uring_sqe *sqe_with_cb(struct io_uring *ring, ev_cb cb, void *ud);
